@@ -1,6 +1,9 @@
 """
 Reinforcement Learning Implementation for Pendulum-v1 Environment
 """
+from collections import deque
+import random
+import math
 
 import gymnasium as gym
 import numpy as np
@@ -8,9 +11,10 @@ import torch
 import torch.nn as nn
 import torch.optim as optim
 import torch.nn.functional as F
-from collections import deque
-import random
 import matplotlib.pyplot as plt
+
+
+LOG_STD_MIN, LOG_STD_MAX = -3.0, 3.0  # Clamp for numerical stability
 
 
 class Policy(nn.Module):
@@ -20,7 +24,7 @@ class Policy(nn.Module):
     def forward(self, state):
         raise NotImplementedError
     
-    def get_action(self, state):
+    def sample(self, state):
         raise NotImplementedError
 
 
@@ -47,7 +51,7 @@ class DummyPolicy(Policy):
         action = torch.tanh(self.fc3(x))
         return action
     
-    def get_action(self, state):
+    def sample(self, state):
         """Get action from policy"""
         with torch.no_grad():
             state_tensor = torch.FloatTensor(state).unsqueeze(0)
@@ -57,51 +61,112 @@ class DummyPolicy(Policy):
             return action.squeeze(0).numpy()
 
 
+class GaussianPolicy(Policy):
+    """
+    This policy outputs a distribution pi_{theta}(a | s), so we can compute the gradient.
+    Normal(mean, std) -> tanh -> scale to env bounds
+    """
+    
+    def __init__(self, state_dim, action_dim, hidden_dim=128):
+        super(GaussianPolicy, self).__init__()
+        self.state_dim = state_dim
+        self.action_dim = action_dim
+
+        self.net = nn.Sequential(
+            nn.Linear(state_dim, hidden_dim),
+            nn.ReLU(),
+            nn.Linear(hidden_dim, hidden_dim),
+            nn.ReLU(),
+        )
+        self.mu_head = nn.Linear(hidden_dim, action_dim)
+        self.logstd_head = nn.Linear(hidden_dim, action_dim)
+        
+    def forward(self, state):
+        # Returns mean and the log of the std_dev - a common trick to ensure non-negativity
+        h = self.net(state)
+        mu = self.mu_head(h)
+        log_std = torch.clamp(self.logstd_head(h), LOG_STD_MIN, LOG_STD_MAX)
+        return mu, log_std
+    
+    def sample(self, state):
+        """Get action from policy"""
+        if not torch.is_tensor(state):  # Boilerplate wrapping to make sure the type is right
+            state = torch.as_tensor(state, dtype=torch.float32)
+        state = state.unsqueeze(0) if state.dim() == 1 else state
+        mu, log_std = self.forward(state)
+        std = torch.exp(log_std)
+        eps = torch.randn_like(mu)
+        z = mu + std * eps
+        action_raw = torch.tanh(z)
+        # Scale to Pendulum action space [-2, 2]
+        action = action_raw * 2.0
+        
+        # Solve for the correct log(pi(a | s)) using the change-of-variables
+        log_p_z = -0.5 * (((z - mu) / std)**2 + 2*log_std + math.log(2*math.pi))
+        log_p_z = log_p_z.sum(dim=-1, keepdim=True)
+        log_det_tanh = torch.log(1 - action_raw.pow(2) + 1e-6).sum(dim=-1, keepdim=True)
+        log_det_scale = -math.log(2.0) * mu.shape[-1]
+        log_prob = log_p_z - log_det_tanh + log_det_scale
+        return action.squeeze(0), log_prob.squeeze(0)
+
+
 class PendulumRL:
     """
     Main RL class for training on Pendulum-v1 environment
     """
     
-    def __init__(self, env_name='Pendulum-v1', lr=3e-4, gamma=0.99, batch_size=64, render=False):
+    def __init__(self, policy_cls, env_name='Pendulum-v1', lr=3e-4, gamma=0.99, render=False):
         render_params = dict(render_mode="human") if render else {}
         self.env = gym.make(env_name, **render_params)
-        self.policy = DummyPolicy(
+        self.policy = policy_cls(
             state_dim=self.env.observation_space.shape[0],
             action_dim=self.env.action_space.shape[0]
         )
         self.optimizer = optim.Adam(self.policy.parameters(), lr=lr)
         
         self.gamma = gamma
-        self.batch_size = batch_size
-        self._current_batch = []
         
         # Debugging info
         self._episode_rewards = []
-        
+
+        # Episode storage for training
+        self._states = []
+        self._actions = []
+        self._log_probs = []
+        self._rewards = []
+
     def select_action(self, state):
-        """Select action using current policy"""
-        action = self.policy.get_action(state)
-        return action
+        state_t = torch.as_tensor(state, dtype=torch.float32)
+        action_t, logp_t = self.policy.sample(state_t)
+        return action_t.detach().numpy(), logp_t
+
+    def _compute_returns_to_go(self, rewards):
+        # G_t = r_t + gamma * r_{t+1} + ...
+        # Save all of them so we can leverage the causality argument
+        G = []
+        running = 0.0
+        for r in reversed(rewards):
+            running = r + self.gamma * running
+            G.append(running)
+        G.reverse()
+        return torch.as_tensor(G, dtype=torch.float32)
     
     def update_policy(self):
-        """Update policy using stored experiences"""
-        states, actions, rewards, next_states, dones = map(np.stack, zip(*self._current_batch))
-        
-        # Convert to tensors
-        states = torch.FloatTensor(states)
-        actions = torch.FloatTensor(actions)
-        rewards = torch.FloatTensor(rewards).unsqueeze(1)
-        next_states = torch.FloatTensor(next_states)
-        dones = torch.BoolTensor(dones).unsqueeze(1)
-        
-        # FIXME: Compute policy loss
-        # F.mse_loss(...)
-        # Update policy
+        returns = self._compute_returns_to_go(self._rewards)
+        logps = torch.stack(self._log_probs)
+        policy_loss = -(logps * returns).mean()
+
         self.optimizer.zero_grad()
-        # action_loss.backward()
+        policy_loss.backward()
         self.optimizer.step()
 
-        self._current_batch = []
+        # clear storage
+        self._states.clear()
+        self._actions.clear()
+        self._log_probs.clear()
+        self._rewards.clear()
+
+        return float(policy_loss.item())
     
     def run_episode(self, is_training=True):
         """Train for one episode"""
@@ -109,15 +174,22 @@ class PendulumRL:
         
         episode_reward = 0
         while True:
-            action = self.select_action(state)
-            next_state, reward, terminated, truncated, info = self.env.step(action)
-            self._current_batch.append((state, action, reward, next_state, terminated or truncated))
-            
-            state = next_state
+            # TODO: Possibly make action deterministic if is_training=False
+            action, logp = self.select_action(state)
+            next_state, reward, terminated, truncated, _ = self.env.step(action)
+            done = terminated or truncated
             episode_reward += reward
-            
-            if terminated or truncated:
+
+            if is_training:
+                self._states.append(state)
+                self._actions.append(action)
+                self._log_probs.append(logp if logp.dim() == 0 else logp.squeeze())
+                self._rewards.append(reward)
+
+            state = next_state
+            if done:
                 break
+
         
         if is_training:
             self.update_policy()
@@ -188,7 +260,7 @@ def main():
     random.seed(42)
     
     # Create RL agent
-    agent = PendulumRL()
+    agent = PendulumRL(policy_cls=GaussianPolicy)
     # Train the agent
     episode_rewards, eval_rewards = agent.train(
         num_episodes=500,
